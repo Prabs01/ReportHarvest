@@ -1,18 +1,17 @@
 """
-BSE India Annual Report Scraper
-================================
-Downloads annual reports (2015/16 - 2024/25) for all Nifty 500 companies
-from bseindia.com
+NiftyArchive — BSE Annual Report Scraper
+==========================================
+Downloads annual reports (2015/16 - 2024/25) for Nifty 500 companies.
+
+THE FIX: Instead of doing a live API lookup per company (which was returning
+ABB India for everything), we download BSE's full scrip master list once and
+do fuzzy name matching locally. This is reliable and fast.
 
 Requirements:
-    pip install requests openpyxl pandas
+    pip install requests openpyxl pandas bsedata
 
 Usage:
     python bse_annual_report_scraper.py
-
-Output:
-    ./annual_reports/<CompanyName>_<Year>.pdf
-    ./bse_scraper_log.csv  (log of all successes/failures)
 """
 
 import requests
@@ -21,24 +20,25 @@ import os
 import re
 import time
 import csv
-import json
 import logging
-from datetime import datetime
 from pathlib import Path
+from difflib import get_close_matches
+from datetime import datetime
 
 # ─────────────────────────── CONFIGURATION ───────────────────────────────────
 
-EXCEL_FILE     = "ind_nifty500list.xlsx"   # Path to your Nifty 500 Excel file
-OUTPUT_DIR     = "./annual_reports"         # Where PDFs will be saved
-LOG_FILE       = "./bse_scraper_log.csv"    # CSV log of results
-YEARS          = [                          # Financial years to download
+EXCEL_FILE  = "ind_nifty500list.xlsx"
+OUTPUT_DIR  = "./annual_reports"
+LOG_FILE    = "./scraper_log.csv"
+
+YEARS = [
     "2015-16", "2016-17", "2017-18", "2018-19", "2019-20",
     "2020-21", "2021-22", "2022-23", "2023-24", "2024-25",
 ]
 
-DELAY_BETWEEN_COMPANIES = 2   # seconds between companies (be polite to BSE)
-DELAY_BETWEEN_REQUESTS  = 0.5 # seconds between API calls for one company
-REQUEST_TIMEOUT         = 20  # seconds
+DELAY_BETWEEN_COMPANIES = 2    # seconds — be polite to BSE
+DELAY_BETWEEN_REQUESTS  = 0.5
+REQUEST_TIMEOUT         = 25
 
 HEADERS = {
     "User-Agent": (
@@ -49,128 +49,112 @@ HEADERS = {
     "Referer":         "https://www.bseindia.com/",
     "Accept":          "application/json, text/plain, */*",
     "Accept-Language": "en-US,en;q=0.9",
-    "Origin":          "https://www.bseindia.com",
 }
 
-# ─────────────────────────── LOGGING SETUP ───────────────────────────────────
+# ─────────────────────────── LOGGING ─────────────────────────────────────────
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s  %(levelname)-8s  %(message)s",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler("bse_scraper.log", encoding="utf-8"),
+        logging.FileHandler("scraper.log", encoding="utf-8"),
     ],
 )
 log = logging.getLogger(__name__)
 
-# ─────────────────────────── HELPERS ─────────────────────────────────────────
+# ─────────────────────────── SCRIP CODE MASTER ───────────────────────────────
 
-def clean_company_name(name: str) -> str:
-    """Convert company name to safe filename format."""
-    name = name.strip()
-    # Remove trailing punctuation like '.'
-    name = name.rstrip(".")
-    # Replace spaces and special chars with underscores
-    name = re.sub(r"[^\w\s-]", "", name)
-    name = re.sub(r"[\s]+", "_", name)
-    name = re.sub(r"_+", "_", name)
-    return name.strip("_")
-
-
-def year_to_date_range(year: str):
+def build_scrip_master() -> dict:
     """
-    '2015-16' → from_date='20150401', to_date='20160930'
-    We use a wide window so we catch reports filed any time during/after the FY.
+    Download BSE's full scrip master (all listed equities) and return a
+    dict of {normalised_company_name: scrip_code}.
+
+    Uses bsedata's updateScripCodes() which fetches the official BSE CSV.
+    Falls back to a direct CSV download if bsedata is not installed.
     """
-    start_yr = int(year.split("-")[0])
-    # Annual reports are usually filed 6-18 months after FY end
-    from_date = f"{start_yr}0101"
-    to_date   = f"{start_yr + 2}1231"
-    return from_date, to_date
-
-
-def get_scrip_code(session: requests.Session, company_name: str) -> str | None:
-    """Look up BSE scrip code by company name using BSE's search API."""
-    url = "https://api.bseindia.com/BseIndiaAPI/api/fetchcomp/w"
+    # Method A: bsedata library
     try:
-        r = session.get(url, params={"scripcode": company_name}, headers=HEADERS,
-                        timeout=REQUEST_TIMEOUT)
-        if r.status_code != 200:
-            return None
-        data = r.json()
-        # Response: list of {SCRIP_CD, FULL_NM, ...}
-        if isinstance(data, list) and data:
-            return str(data[0].get("SCRIP_CD", ""))
-        return None
+        from bsedata.bse import BSE as BSEData
+        log.info("Building scrip master via bsedata ...")
+        b = BSEData(update_codes=True)
+        raw = b.getScripCodes()          # {scrip_code: company_name}
+        master = {normalise(v): str(k) for k, v in raw.items()}
+        log.info(f"  Scrip master loaded: {len(master):,} companies")
+        return master
+    except ImportError:
+        pass
     except Exception as e:
-        log.warning(f"  Scrip lookup failed for '{company_name}': {e}")
-        return None
+        log.warning(f"bsedata failed: {e}")
 
-
-def search_scrip_code(session: requests.Session, company_name: str) -> str | None:
-    """Alternative: use BSE's typeahead/search endpoint."""
-    url = "https://api.bseindia.com/BseIndiaAPI/api/ComHeadernew/w"
+    # Method B: direct BSE API
+    log.info("Building scrip master via BSE API ...")
+    url = "https://api.bseindia.com/BseIndiaAPI/api/ListofScripData/w"
+    params = {"Group": "", "Scripcode": "", "industry": "",
+              "segment": "Equity", "status": "Active"}
     try:
-        r = session.get(url, params={"code": company_name}, headers=HEADERS,
-                        timeout=REQUEST_TIMEOUT)
-        if r.status_code != 200:
-            return None
+        r = requests.get(url, params=params, headers=HEADERS, timeout=30)
         data = r.json()
-        # Returns list of matches
-        if isinstance(data, list) and data:
-            return str(data[0].get("SCRIP_CD", ""))
-        return None
+        rows = data if isinstance(data, list) else data.get("Table", [])
+        master = {}
+        for row in rows:
+            code = str(row.get("SCRIP_CD") or row.get("scripCode") or "")
+            name = row.get("LONG_NM") or row.get("companyName") or ""
+            if code and name:
+                master[normalise(name)] = code
+        log.info(f"  Scrip master loaded: {len(master):,} companies")
+        return master
     except Exception as e:
-        log.warning(f"  Search scrip lookup failed for '{company_name}': {e}")
-        return None
+        log.error(f"Could not build scrip master: {e}")
+        return {}
 
 
-def get_scrip_code_robust(session: requests.Session, company_name: str) -> str | None:
-    """Try multiple BSE endpoints to find the scrip code."""
-    endpoints = [
-        # Endpoint 1: direct search
-        ("https://api.bseindia.com/BseIndiaAPI/api/fetchcomp/w",
-         {"scripcode": company_name}),
-        # Endpoint 2: typeahead search
-        ("https://api.bseindia.com/BseIndiaAPI/api/ComHeadernew/w",
-         {"code": company_name}),
-        # Endpoint 3: list with search
-        ("https://api.bseindia.com/BseIndiaAPI/api/ListofScripData/w",
-         {"Group": "", "Scripcode": "", "industry": "",
-          "segment": "Equity", "status": "Active", "companyname": company_name}),
-    ]
-    for url, params in endpoints:
-        try:
-            r = session.get(url, params=params, headers=HEADERS,
-                            timeout=REQUEST_TIMEOUT)
-            if r.status_code != 200:
-                continue
-            data = r.json()
-            # Handle list response
-            if isinstance(data, list) and data:
-                code = data[0].get("SCRIP_CD") or data[0].get("scripCode")
-                if code:
-                    return str(code)
-            # Handle dict with Table key
-            if isinstance(data, dict):
-                table = data.get("Table") or data.get("data") or []
-                if table:
-                    code = table[0].get("SCRIP_CD") or table[0].get("scripCode")
-                    if code:
-                        return str(code)
-            time.sleep(0.3)
-        except Exception as e:
-            log.debug(f"  Endpoint {url} failed: {e}")
-    return None
+def normalise(name: str) -> str:
+    """Lowercase, strip common suffixes, collapse whitespace for matching."""
+    name = name.lower().strip()
+    for suffix in [
+        r"\blimited\b", r"\bltd\.?\b", r"\bltd\b",
+        r"\bpvt\.?\b", r"\bprivate\b", r"\bco\.?\b",
+        r"\bcompany\b", r"\bindustries\b", r"\bindustry\b",
+        r"\benterprises\b", r"\bcorporation\b", r"\bcorp\.?\b",
+    ]:
+        name = re.sub(suffix, "", name)
+    name = re.sub(r"[^\w\s]", " ", name)
+    name = re.sub(r"\s+", " ", name).strip()
+    return name
 
 
-def fetch_announcements(session: requests.Session, scrip_code: str,
-                         from_date: str, to_date: str) -> list[dict]:
+def find_scrip_code(company_name: str, master: dict) -> tuple:
     """
-    Fetch all corporate announcements for a scrip within a date range.
-    Paginates automatically until all pages are fetched.
+    Return (scrip_code, matched_name) for a company name.
+    Uses exact normalised match, then fuzzy, then substring.
+    Returns ('', '') if nothing found.
     """
+    key = normalise(company_name)
+
+    # 1. Exact match
+    if key in master:
+        return master[key], key
+
+    # 2. Fuzzy match
+    candidates = get_close_matches(key, master.keys(), n=1, cutoff=0.75)
+    if candidates:
+        best = candidates[0]
+        log.info(f"  Fuzzy matched '{company_name}' -> '{best}'")
+        return master[best], best
+
+    # 3. Substring match
+    for mkey, code in master.items():
+        if key in mkey or mkey in key:
+            log.info(f"  Substring matched '{company_name}' -> '{mkey}'")
+            return code, mkey
+
+    return "", ""
+
+# ─────────────────────────── ANNOUNCEMENT FETCHER ────────────────────────────
+
+def fetch_all_announcements(session: requests.Session, scrip_code: str) -> list:
+    """Fetch ALL corporate announcements for a scrip. Handles pagination."""
     url = "https://api.bseindia.com/BseIndiaAPI/api/AnnSubCategoryGetData/w"
     all_rows = []
     page = 1
@@ -178,11 +162,11 @@ def fetch_announcements(session: requests.Session, scrip_code: str,
     while True:
         params = {
             "pageno":      page,
-            "strCat":      "-1",       # all categories
-            "strPrevDate": from_date,
+            "strCat":      "-1",
+            "strPrevDate": "20140101",
             "strScrip":    scrip_code,
             "strSearch":   "P",
-            "strToDate":   to_date,
+            "strToDate":   "20261231",
             "strType":     "C",
             "subcategory": "-1",
         }
@@ -190,11 +174,11 @@ def fetch_announcements(session: requests.Session, scrip_code: str,
             r = session.get(url, params=params, headers=HEADERS,
                             timeout=REQUEST_TIMEOUT)
             if r.status_code != 200:
-                log.warning(f"  Announcements API returned {r.status_code}")
+                log.warning(f"  Announcements API {r.status_code}")
                 break
             data = r.json()
         except Exception as e:
-            log.warning(f"  Announcements fetch error: {e}")
+            log.warning(f"  Fetch error: {e}")
             break
 
         rows  = data.get("Table",  [])
@@ -202,311 +186,230 @@ def fetch_announcements(session: requests.Session, scrip_code: str,
         total = int(meta[0].get("ROWCNT", 0)) if meta else 0
 
         all_rows.extend(rows)
-
-        if len(all_rows) >= total or not rows:
+        if not rows or len(all_rows) >= total:
             break
+
         page += 1
         time.sleep(DELAY_BETWEEN_REQUESTS)
 
     return all_rows
 
+# ─────────────────────────── YEAR EXTRACTION ─────────────────────────────────
 
-def is_annual_report(subject: str) -> bool:
-    """Return True if the announcement subject looks like an annual report."""
-    subject_lower = subject.lower()
-    keywords = ["annual report", "annual-report", "annualreport"]
-    return any(kw in subject_lower for kw in keywords)
-
-
-def extract_fy_from_subject(subject: str, default_from_date: str) -> str | None:
+def extract_fy(subject: str, news_date: str) -> str:
     """
-    Try to extract the financial year label from the announcement subject.
-    e.g. 'Annual Report 2021-22' → '2021-22'
-         'Annual Report for FY 2022' → '2021-22'
-    Falls back to deriving year from from_date.
+    Determine the financial year label (e.g. '2021-22') from subject or date.
     """
-    # Pattern 1: "2021-22" or "2021-2022"
-    m = re.search(r"(20\d{2})[-–/](20)?(\d{2})", subject)
+    # "2021-22" or "2021-2022"
+    m = re.search(r"(20\d{2})[.\u2013\-/](20)?(\d{2})\b", subject)
     if m:
-        start = m.group(1)
-        end   = m.group(3)
-        return f"{start}-{end}"
+        return f"{m.group(1)}-{m.group(3)}"
 
-    # Pattern 2: "FY2022" or "FY 2022"
+    # "FY2022" or "FY 2022"
     m = re.search(r"FY\s*(\d{4})", subject, re.IGNORECASE)
     if m:
-        end_yr   = int(m.group(1))
-        start_yr = end_yr - 1
-        return f"{start_yr}-{str(end_yr)[2:]}"
+        end = int(m.group(1))
+        return f"{end - 1}-{str(end)[2:]}"
 
-    # Pattern 3: standalone year "2022"
+    # Standalone 4-digit year
     m = re.search(r"\b(20\d{2})\b", subject)
     if m:
-        end_yr   = int(m.group(1))
-        start_yr = end_yr - 1
-        return f"{start_yr}-{str(end_yr)[2:]}"
+        end = int(m.group(1))
+        return f"{end - 1}-{str(end)[2:]}"
 
-    return None
+    # Fall back to news date
+    if news_date:
+        try:
+            dt = datetime.strptime(news_date[:10], "%Y-%m-%d")
+            end = dt.year if dt.month >= 7 else dt.year - 1
+            return f"{end - 1}-{str(end)[2:]}"
+        except Exception:
+            pass
+
+    return ""
 
 
-def download_pdf(session: requests.Session, attachment: str,
-                 save_path: Path) -> bool:
-    """Download a PDF from BSE's corpfiling store. Returns True on success."""
-    pdf_url = (
-        f"https://www.bseindia.com/xml-data/corpfiling/AttachHis/{attachment}"
-    )
+def is_annual_report(subject: str) -> bool:
+    s = subject.lower()
+    return any(kw in s for kw in ["annual report", "annual-report", "annualreport"])
+
+# ─────────────────────────── PDF DOWNLOADER ──────────────────────────────────
+
+def download_pdf(session: requests.Session, attachment: str, save_path: Path) -> bool:
+    url = f"https://www.bseindia.com/xml-data/corpfiling/AttachHis/{attachment}"
     try:
-        r = session.get(pdf_url, headers=HEADERS, timeout=60, stream=True)
+        r = session.get(url, headers=HEADERS, timeout=60, stream=True)
         if r.status_code != 200:
-            log.warning(f"  PDF download failed (HTTP {r.status_code}): {pdf_url}")
+            log.warning(f"  HTTP {r.status_code}: {url}")
             return False
-        # Check it's actually a PDF
-        content_type = r.headers.get("Content-Type", "")
-        if "pdf" not in content_type.lower() and not attachment.endswith(".pdf"):
-            log.warning(f"  Not a PDF (Content-Type={content_type}): {pdf_url}")
-            return False
-
         save_path.parent.mkdir(parents=True, exist_ok=True)
         with open(save_path, "wb") as f:
-            for chunk in r.iter_content(chunk_size=8192):
+            for chunk in r.iter_content(8192):
                 f.write(chunk)
-
         size_kb = save_path.stat().st_size / 1024
-        if size_kb < 10:
-            # Suspiciously small — likely an error HTML page
+        if size_kb < 20:
             save_path.unlink()
-            log.warning(f"  Downloaded file too small ({size_kb:.1f} KB), discarding.")
+            log.warning(f"  File too small ({size_kb:.1f} KB) — likely error page")
             return False
-
-        log.info(f"  ✓ Saved ({size_kb:.0f} KB): {save_path.name}")
+        log.info(f"  OK  {save_path.name}  ({size_kb:.0f} KB)")
         return True
-
     except Exception as e:
-        log.warning(f"  PDF download exception: {e}")
+        log.warning(f"  Download error: {e}")
         return False
 
+# ─────────────────────────── PER-COMPANY LOGIC ───────────────────────────────
 
-# ─────────────────────────── MAIN SCRAPER ────────────────────────────────────
+def clean_name(name: str) -> str:
+    name = name.strip().rstrip(".")
+    name = re.sub(r"[^\w\s-]", "", name)
+    name = re.sub(r"\s+", "_", name)
+    return re.sub(r"_+", "_", name).strip("_")
 
-def scrape_company(session: requests.Session, company_name: str,
-                   clean_name: str, log_rows: list) -> None:
-    """Scrape all annual reports for a single company across all target years."""
-    log.info(f"\n{'─'*60}")
-    log.info(f"Company: {company_name}")
 
-    # ── Step 1: Get scrip code ────────────────────────────────────────────────
-    scrip_code = get_scrip_code_robust(session, company_name)
-    if not scrip_code:
-        log.warning(f"  ✗ Could not find scrip code — skipping.")
-        for yr in YEARS:
-            log_rows.append({
-                "company":    company_name,
-                "year":       yr,
-                "status":     "FAILED",
-                "reason":     "Scrip code not found",
-                "filename":   "",
-                "url":        "",
-            })
-        return
+def scrape_company(session, company_name, scrip_code, log_rows, done_pairs):
+    file_prefix  = clean_name(company_name)
+    downloaded   = set()
 
-    log.info(f"  Scrip Code: {scrip_code}")
+    announcements = fetch_all_announcements(session, scrip_code)
+    log.info(f"  {len(announcements)} total announcements")
 
-    # ── Step 2: Fetch announcements for full period ───────────────────────────
-    # We fetch a wide range once, then match by year in subject/date
-    from_date = f"{int(YEARS[0].split('-')[0]) - 1}0101"   # 1 year before first FY
-    to_date   = f"{int(YEARS[-1].split('-')[0]) + 2}1231"  # 1 year after last FY
-
-    time.sleep(DELAY_BETWEEN_REQUESTS)
-    announcements = fetch_announcements(session, scrip_code, from_date, to_date)
-    log.info(f"  Found {len(announcements)} total announcements")
-
-    # ── Step 3: Filter to annual report announcements ─────────────────────────
-    ar_filings = []
-    for ann in announcements:
-        subject = ann.get("NEWSSUB", "") or ann.get("HEADLINE", "") or ""
-        if is_annual_report(subject):
-            ar_filings.append(ann)
-
-    log.info(f"  Found {len(ar_filings)} annual report filings")
-
-    if not ar_filings:
-        log.warning("  No annual report filings found in announcements.")
-        for yr in YEARS:
-            log_rows.append({
-                "company":  company_name,
-                "year":     yr,
-                "status":   "NOT_FOUND",
-                "reason":   "No annual report announcements found",
-                "filename": "",
-                "url":      "",
-            })
-        return
-
-    # ── Step 4: Match each filing to a target year and download ──────────────
-    downloaded_years = set()
+    ar_filings = [
+        a for a in announcements
+        if is_annual_report(a.get("NEWSSUB", "") or a.get("HEADLINE", ""))
+    ]
+    log.info(f"  {len(ar_filings)} annual report filings")
 
     for ann in ar_filings:
         subject    = ann.get("NEWSSUB", "") or ann.get("HEADLINE", "") or ""
         attachment = ann.get("ATTACHMENTNAME", "")
         news_date  = ann.get("NEWS_DT", "") or ann.get("DissemDt", "") or ""
 
-        if not attachment or not attachment.endswith(".pdf"):
+        if not attachment or not attachment.lower().endswith(".pdf"):
             continue
 
-        # Try to figure out which FY this report is for
-        fy = extract_fy_from_subject(subject, "")
-
-        # If we can't extract FY from subject, infer from filing date
-        if not fy and news_date:
-            try:
-                dt = datetime.strptime(news_date[:10], "%Y-%m-%d")
-                # Annual reports are filed Apr–Dec; FY ended in March of that year
-                if dt.month >= 4:
-                    end_yr   = dt.year
-                else:
-                    end_yr   = dt.year - 1
-                start_yr = end_yr - 1
-                fy = f"{start_yr}-{str(end_yr)[2:]}"
-            except Exception:
-                pass
-
-        if not fy or fy not in YEARS:
+        fy = extract_fy(subject, news_date)
+        if not fy or fy not in YEARS or fy in downloaded:
+            continue
+        if (company_name, fy) in done_pairs:
+            log.info(f"  skip {fy} (already done)")
+            downloaded.add(fy)
             continue
 
-        if fy in downloaded_years:
-            continue  # Already got this year
-
-        safe_filename = f"{clean_name}_{fy}.pdf"
-        save_path     = Path(OUTPUT_DIR) / safe_filename
-        pdf_url       = (
-            f"https://www.bseindia.com/xml-data/corpfiling/AttachHis/{attachment}"
-        )
+        filename  = f"{file_prefix}_{fy}.pdf"
+        save_path = Path(OUTPUT_DIR) / filename
 
         if save_path.exists():
-            log.info(f"  ⤵  Already exists, skipping: {safe_filename}")
-            downloaded_years.add(fy)
-            log_rows.append({
-                "company":  company_name,
-                "year":     fy,
-                "status":   "SKIPPED",
-                "reason":   "File already exists",
-                "filename": safe_filename,
-                "url":      pdf_url,
-            })
+            log.info(f"  skip {filename} (file exists)")
+            downloaded.add(fy)
+            log_rows.append(dict(company=company_name, year=fy,
+                                 status="SKIPPED", reason="Already exists",
+                                 filename=filename))
             continue
 
-        log.info(f"  Downloading FY {fy}: {subject[:70]}")
+        log.info(f"  -> FY {fy}: {subject[:70]}")
         time.sleep(DELAY_BETWEEN_REQUESTS)
-        success = download_pdf(session, attachment, save_path)
+        ok = download_pdf(session, attachment, save_path)
 
-        log_rows.append({
-            "company":  company_name,
-            "year":     fy,
-            "status":   "SUCCESS" if success else "FAILED",
-            "reason":   "" if success else "PDF download failed",
-            "filename": safe_filename if success else "",
-            "url":      pdf_url,
-        })
+        log_rows.append(dict(
+            company=company_name, year=fy,
+            status="SUCCESS" if ok else "FAILED",
+            reason="" if ok else "Download failed",
+            filename=filename if ok else "",
+        ))
+        if ok:
+            downloaded.add(fy)
 
-        if success:
-            downloaded_years.add(fy)
-
-    # ── Step 5: Log any target years that weren't found ───────────────────────
     for yr in YEARS:
-        if yr not in downloaded_years:
-            already_logged = any(
-                r["company"] == company_name and r["year"] == yr
-                for r in log_rows
-            )
-            if not already_logged:
-                log_rows.append({
-                    "company":  company_name,
-                    "year":     yr,
-                    "status":   "NOT_FOUND",
-                    "reason":   "No filing found for this year",
-                    "filename": "",
-                    "url":      "",
-                })
+        if yr not in downloaded and not any(
+            r["company"] == company_name and r["year"] == yr for r in log_rows
+        ):
+            log_rows.append(dict(company=company_name, year=yr,
+                                 status="NOT_FOUND", reason="No filing found",
+                                 filename=""))
+
+# ─────────────────────────── MAIN ────────────────────────────────────────────
+
+def write_log(rows):
+    if not rows:
+        return
+    with open(LOG_FILE, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=["company","year","status","reason","filename"])
+        w.writeheader()
+        w.writerows(rows)
 
 
 def main():
-    # ── Load company list ─────────────────────────────────────────────────────
     df = pd.read_excel(EXCEL_FILE, header=None, names=["Company", "Industry"])
     companies = df["Company"].dropna().str.strip().tolist()
-    log.info(f"Loaded {len(companies)} companies from {EXCEL_FILE}")
-    log.info(f"Target years: {YEARS[0]} → {YEARS[-1]}")
-    log.info(f"Output directory: {OUTPUT_DIR}\n")
-
+    log.info(f"Loaded {len(companies)} companies")
     Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
 
-    log_rows = []
+    # KEY FIX: build scrip master ONCE from BSE's full list
+    master = build_scrip_master()
+    if not master:
+        log.error("Scrip master is empty. Install bsedata:  pip install bsedata")
+        return
 
-    # ── Resume support: load existing log to skip done companies ─────────────
+    # Resume support
+    log_rows   = []
     done_pairs = set()
     if Path(LOG_FILE).exists():
         with open(LOG_FILE, newline="", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                if row.get("status") in ("SUCCESS", "SKIPPED"):
+            for row in csv.DictReader(f):
+                if row["status"] in ("SUCCESS", "SKIPPED"):
                     done_pairs.add((row["company"], row["year"]))
-        log.info(f"Resuming: {len(done_pairs)} already-completed (company, year) pairs found.")
+        log.info(f"Resuming — {len(done_pairs)} pairs already complete")
 
-    # ── HTTP session ──────────────────────────────────────────────────────────
     session = requests.Session()
     session.headers.update(HEADERS)
-
-    # Warm up the session — BSE sometimes needs a browser-like first request
     try:
         session.get("https://www.bseindia.com/", timeout=15)
         time.sleep(1)
     except Exception:
         pass
 
-    # ── Process each company ──────────────────────────────────────────────────
-    for idx, company in enumerate(companies, 1):
-        clean_name = clean_company_name(company)
+    no_code = []
 
-        # Skip if all years already done for this company
-        all_done = all((company, yr) in done_pairs for yr in YEARS)
-        if all_done:
-            log.info(f"[{idx}/{len(companies)}] Skipping (all years done): {company}")
+    for idx, company in enumerate(companies, 1):
+        log.info(f"\n[{idx}/{len(companies)}] {company}")
+
+        scrip_code, _ = find_scrip_code(company, master)
+
+        if not scrip_code:
+            log.warning("  No scrip code found — skipping")
+            no_code.append(company)
+            for yr in YEARS:
+                log_rows.append(dict(company=company, year=yr,
+                                     status="FAILED",
+                                     reason="Scrip code not found",
+                                     filename=""))
+            write_log(log_rows)
             continue
 
-        log.info(f"\n[{idx}/{len(companies)}]")
-        scrape_company(session, company, clean_name, log_rows)
+        if all((company, yr) in done_pairs for yr in YEARS):
+            log.info("  All years done — skipping")
+            continue
 
-        # Write log incrementally (so progress is saved even if script crashes)
-        _write_log(log_rows)
-
+        scrape_company(session, company, scrip_code, log_rows, done_pairs)
+        write_log(log_rows)
         time.sleep(DELAY_BETWEEN_COMPANIES)
 
     session.close()
 
-    log.info("\n" + "="*60)
-    log.info("SCRAPING COMPLETE")
-    _print_summary(log_rows)
-    log.info(f"Full log saved to: {LOG_FILE}")
-
-
-def _write_log(log_rows: list) -> None:
-    """Write/overwrite the CSV log file."""
-    if not log_rows:
-        return
-    with open(LOG_FILE, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(
-            f, fieldnames=["company", "year", "status", "reason", "filename", "url"]
-        )
-        writer.writeheader()
-        writer.writerows(log_rows)
-
-
-def _print_summary(log_rows: list) -> None:
     from collections import Counter
     counts = Counter(r["status"] for r in log_rows)
-    log.info(f"  SUCCESS   : {counts.get('SUCCESS',   0)}")
-    log.info(f"  SKIPPED   : {counts.get('SKIPPED',   0)}")
-    log.info(f"  NOT_FOUND : {counts.get('NOT_FOUND', 0)}")
-    log.info(f"  FAILED    : {counts.get('FAILED',    0)}")
+    log.info("\n" + "="*50)
+    log.info(f"SUCCESS   : {counts.get('SUCCESS',   0)}")
+    log.info(f"SKIPPED   : {counts.get('SKIPPED',   0)}")
+    log.info(f"NOT_FOUND : {counts.get('NOT_FOUND', 0)}")
+    log.info(f"FAILED    : {counts.get('FAILED',    0)}")
+    log.info(f"Log: {LOG_FILE}")
+
+    if no_code:
+        log.info(f"\nNo scrip code found for {len(no_code)} companies:")
+        for c in no_code:
+            log.info(f"  - {c}")
+        log.info("Look these up manually on bseindia.com")
 
 
 if __name__ == "__main__":
