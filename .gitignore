@@ -1,0 +1,9 @@
+.venv
+
+.DS_Store
+
+annual_reports
+
+bse_scraper.log
+
+bse_scraper_log.csv
